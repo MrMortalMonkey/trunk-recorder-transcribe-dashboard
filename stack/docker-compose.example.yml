@@ -1,0 +1,72 @@
+version: "3.9"
+
+services:
+
+  watcher:
+    build: ../services/watcher
+    container_name: trunk-watcher
+    restart: unless-stopped
+
+    volumes:
+      # Path to your Trunk Recorder recordings directory
+      - /opt/trunk-recorder/station_name:/recordings
+
+    environment:
+      DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY}
+      DATABASE_URL: postgres://transcribe:${POSTGRES_PASSWORD}@postgres:5432/transcripts
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      WS_BROADCAST_URL: http://watcher:9000/broadcast
+
+    ports:
+      - "9000:9000"
+
+    depends_on:
+      - postgres
+      - meilisearch
+
+
+  postgres:
+    image: postgres:16
+    container_name: trunk-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: transcripts
+      POSTGRES_USER: transcribe
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.7
+    container_name: trunk-meilisearch
+    restart: unless-stopped
+
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+
+    volumes:
+      - meili-data:/meili_data
+
+    ports:
+      - "7700:7700"
+
+
+  dashboard:
+    build: ../docker
+    container_name: trunk-dashboard
+    restart: unless-stopped
+
+    ports:
+      - "8080:80"
+
+    depends_on:
+      - watcher
+
+
+volumes:
+  postgres-data:
+  meili-data:
