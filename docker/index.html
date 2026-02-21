@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trunk Recorder Dashboard</title>
+
+<style>
+
+body{
+font-family:Arial,Helvetica,sans-serif;
+background:#0f0f0f;
+color:#e0e0e0;
+margin:0;
+transition:.25s;
+}
+
+body.light-mode{
+background:#fff;
+color:#111;
+}
+
+.header{
+position:sticky;
+top:0;
+background:#111;
+padding:10px 12px;
+border-bottom:1px solid #222;
+z-index:500;
+}
+
+body.light-mode .header{
+background:#f5f5f5;
+border-bottom:1px solid #ddd;
+}
+
+.title{
+font-size:1.1em;
+font-weight:bold;
+display:flex;
+gap:6px;
+align-items:center;
+}
+
+.status{
+padding:3px 8px;
+border-radius:6px;
+font-size:.7em;
+}
+
+.live{background:#007bff;}
+.paused{background:#aa0000;}
+
+.controls{
+display:flex;
+flex-direction:column;
+gap:6px;
+margin-top:8px;
+}
+
+.control-row{
+display:flex;
+gap:6px;
+}
+
+.control-row input,
+.control-row select{
+flex:1;
+}
+
+.control-row button{
+flex:1;
+}
+
+button,select,input{
+padding:6px 8px;
+background:#222;
+border:1px solid #444;
+color:white;
+border-radius:6px;
+cursor:pointer;
+font-size:.85em;
+}
+
+body.light-mode button,
+body.light-mode select,
+body.light-mode input{
+background:#f3f3f3;
+color:#111;
+border:1px solid #ccc;
+}
+
+#calls{
+padding:12px;
+}
+
+.call{
+border-bottom:1px solid #222;
+padding:10px 0;
+}
+
+body.light-mode .call{
+border-bottom:1px solid #ddd;
+}
+
+.meta{
+font-size:.75em;
+color:#999;
+margin-bottom:4px;
+}
+
+.tg{
+display:inline-block;
+padding:2px 8px;
+border-radius:4px;
+margin-left:6px;
+font-size:.75em;
+}
+
+.keyword{
+color:#ffcc00;
+font-weight:bold;
+}
+
+.search-hit{
+background:#ffd54a;
+color:#000;
+padding:1px 3px;
+border-radius:3px;
+}
+
+/* SIDEBAR */
+
+#sidebar{
+position:fixed;
+top:64px;
+right:0;
+width:320px;
+height:calc(100% - 64px);
+background:#151515;
+border-left:1px solid #333;
+padding:24px;
+overflow:auto;
+transform:translateX(100%);
+transition:.25s;
+}
+
+body.light-mode #sidebar{
+background:#f5f5f5;
+}
+
+#sidebar.open{
+transform:translateX(0);
+}
+
+.stat-row{
+margin-bottom:10px;
+}
+
+.stat-tg{
+display:inline-block;
+padding:3px 8px;
+border-radius:5px;
+margin-right:6px;
+}
+
+#overlay{
+position:fixed;
+top:0;
+left:0;
+width:100%;
+height:100%;
+background:rgba(0,0,0,.55);
+opacity:0;
+pointer-events:none;
+transition:.25s;
+}
+
+#overlay.show{
+opacity:1;
+pointer-events:auto;
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="header">
+
+<div class="title">
+📡 Trunk Recorder Dashboard
+<span id="liveStatus" class="status live">LIVE</span>
+<span id="callCount"></span>
+</div>
+
+<div class="controls">
+
+<div class="control-row">
+<select id="tgFilter">
+<option value="">All Talkgroups</option>
+</select>
+
+<input id="searchBox" placeholder="Search transcript...">
+</div>
+
+<div class="control-row">
+<button id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
+<button onclick="toggleTheme()">🌗 Theme</button>
+<button onclick="toggleSidebar()">📊 Stats</button>
+</div>
+
+</div>
+
+</div>
+
+<div id="calls"></div>
+
+<div id="overlay" onclick="closeSidebar()"></div>
+
+<div id="sidebar">
+<h3>Statistics</h3>
+<div id="stats"></div>
+</div>
+
+<script>
+
+/*
+Trunk Recorder AI Dashboard
+
+Real-time radio call monitoring dashboard with AI transcription.
+
+Data Sources
+- Trunk Watcher WebSocket API
+- Meilisearch index
+*/
+
+const MEILI_HOST = `${location.protocol}//${location.hostname}:7700`;
+const API_KEY = "CHANGE_ME";
+const INDEX="transcripts";
+
+let allCalls=[];
+let knownIds=new Set();
+
+let paused=false;
+let socket=null;
+
+/* Highlighted keywords in transcripts */
+
+const keywords=[
+"officer","ems","fire","pursuit","shots","gun",
+"ambulance","domestic","accident","traffic","stop"
+];
+
+function tgColor(tg){
+return `hsl(${(tg*137)%360},65%,45%)`;
+}
+
+function formatTime(ts){
+return new Date(ts*1000).toLocaleTimeString([],{
+hour:'2-digit',
+minute:'2-digit',
+second:'2-digit'
+});
+}
+
+function highlightKeywords(text){
+
+keywords.forEach(word=>{
+const r=new RegExp(`\\b(${word})\\b`,"gi");
+text=text.replace(r,'<span class="keyword">$1</span>');
+});
+
+return text;
+}
+
+function highlightSearch(text){
+
+const search=document.getElementById("searchBox").value.trim();
+
+if(!search) return text;
+
+const safe=search.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+const r=new RegExp(`(${safe})`,"gi");
+
+return text.replace(r,'<span class="search-hit">$1</span>');
+}
+
+function updateDropdown(){
+
+const select=document.getElementById("tgFilter");
+const groups={};
+
+allCalls.forEach(c=>{
+groups[c.metadata.talkgroup]=c.metadata.talkgroup_tag||"";
+});
+
+select.innerHTML='<option value="">All Talkgroups</option>';
+
+Object.keys(groups).sort().forEach(tg=>{
+
+const opt=document.createElement("option");
+opt.value=tg;
+opt.textContent=`${tg} - ${groups[tg]}`;
+select.appendChild(opt);
+
+});
+
+}
+
+function updateStats(){
+
+const stats=document.getElementById("stats");
+const tgCount={};
+
+allCalls.forEach(c=>{
+const tg=c.metadata.talkgroup;
+tgCount[tg]=(tgCount[tg]||0)+1;
+});
+
+stats.innerHTML=`<div><strong>Total Calls:</strong> ${allCalls.length}</div><br>`;
+
+Object.entries(tgCount)
+.sort((a,b)=>b[1]-a[1])
+.forEach(([tg,count])=>{
+
+stats.innerHTML+=`
+<div class="stat-row">
+<span class="stat-tg" style="background:${tgColor(tg)}">TG ${tg}</span>
+${count}
+</div>`;
+
+});
+
+}
+
+function render(){
+
+const container=document.getElementById("calls");
+container.innerHTML="";
+
+const filter=document.getElementById("tgFilter").value;
+const search=document.getElementById("searchBox").value.toLowerCase();
+
+allCalls
+.filter(c=>{
+return (!filter || c.metadata.talkgroup==filter)
+&& c.transcript.toLowerCase().includes(search);
+})
+.sort((a,b)=>b.metadata.start_time-a.metadata.start_time)
+.forEach(call=>{
+
+let text=call.transcript;
+text=highlightKeywords(text);
+text=highlightSearch(text);
+
+const div=document.createElement("div");
+div.className="call";
+
+div.innerHTML=`
+<div class="meta">
+${formatTime(call.metadata.start_time)}
+<span class="tg" style="background:${tgColor(call.metadata.talkgroup)}">
+TG ${call.metadata.talkgroup}
+</span>
+${call.metadata.talkgroup_tag||""}
+</div>
+
+<div>${text}</div>
+`;
+
+container.appendChild(div);
+
+});
+
+}
+
+function append(call){
+
+if(knownIds.has(call.id)) return;
+
+knownIds.add(call.id);
+allCalls.push(call);
+
+updateDropdown();
+updateStats();
+
+document.getElementById("callCount").textContent=
+`${allCalls.length} calls`;
+
+render();
+
+}
+
+async function fetchInitial(){
+
+const r=await fetch(`${MEILI_HOST}/indexes/${INDEX}/search`,{
+
+method:"POST",
+headers:{
+"Content-Type":"application/json",
+"Authorization":`Bearer ${API_KEY}`
+},
+body:JSON.stringify({
+q:"",
+limit:250,
+sort:["metadata.start_time:desc"]
+})
+
+});
+
+const d=await r.json();
+d.hits.forEach(append);
+
+}
+
+function connectWebSocket(){
+
+const protocol=
+location.protocol==="https:"?"wss":"ws";
+
+socket=new WebSocket(`${protocol}://${location.hostname}:9000/ws`);
+
+socket.onmessage=(e)=>{
+
+if(paused) return;
+
+append(JSON.parse(e.data));
+
+};
+
+socket.onclose=()=>setTimeout(connectWebSocket,2000);
+
+}
+
+function togglePause(){
+
+paused=!paused;
+
+const btn=document.getElementById("pauseBtn");
+
+if(paused){
+btn.textContent="▶ Resume";
+document.getElementById("liveStatus").className="status paused";
+document.getElementById("liveStatus").textContent="PAUSED";
+}else{
+btn.textContent="⏸ Pause";
+document.getElementById("liveStatus").className="status live";
+document.getElementById("liveStatus").textContent="LIVE";
+}
+
+}
+
+function toggleTheme(){
+document.body.classList.toggle("light-mode");
+}
+
+function toggleSidebar(){
+document.getElementById("sidebar").classList.toggle("open");
+document.getElementById("overlay").classList.toggle("show");
+}
+
+function closeSidebar(){
+document.getElementById("sidebar").classList.remove("open");
+document.getElementById("overlay").classList.remove("show");
+}
+
+document.getElementById("tgFilter").onchange=render;
+document.getElementById("searchBox").oninput=render;
+
+fetchInitial();
+connectWebSocket();
+
+</script>
+
+<div style="text-align:center;font-size:11px;padding:8px;color:#777;">
+Trunk Recorder AI Dashboard
+</div>
+
+</body>
+</html>
